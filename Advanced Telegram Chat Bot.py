@@ -978,21 +978,20 @@ async def fetch_free_proxies():
     return list(proxies)  # Return as a list for further processing
 
 # Function to validate proxies
-def validate_proxy(proxy, test_url='https://duckduckgo.com'):
-    try:
-        response = requests.get(test_url, proxies={"http": proxy, "https": proxy}, timeout=5)
-        if response.status_code == 200:
-            logging.info(f"Proxy {proxy} is valid.")
-            return True
-        elif response.status_code == 429:
-            logging.warning(f"Proxy {proxy} is rate-limited (HTTP 429).")
-            return False  # Rate-limited proxy should be switched
-        else:
-            logging.warning(f"Proxy {proxy} failed with status code {response.status_code}.")
-            return False
-    except Exception as e:
-        logging.error(f"Proxy {proxy} is invalid: {e}")
-        return False
+async def validate_proxy(proxy, test_urls=['https://www.google.com', 'https://www.example.com', 'https://www.wikipedia.org']):
+    timeout = 5
+    for url in test_urls:
+        try:
+            start_time = time.time()
+            response = requests.get(url, proxies={"http": proxy, "https": proxy}, timeout=timeout)
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            elapsed_time = time.time() - start_time
+            if elapsed_time > 2:  # Check if response time is too long
+                return False  # Proxy too slow
+            return True  # Proxy works
+        except requests.exceptions.RequestException as e:
+            return False #Proxy failed
+    return False #Proxy failed all tests
 
 # Function to get a valid proxy and retry if necessary
 async def get_valid_proxy(proxies):
@@ -1849,42 +1848,50 @@ async def keep_typing(chat_id):
         await bot.send_chat_action(chat_id=chat_id, action="typing")
         await asyncio.sleep(3)
 
+import asyncio
+import aiohttp
+import json
+import re
+from telegram import Update
+from telegram.ext import ContextTypes
+from sentence_transformers import SentenceTransformer
+# ... other imports (ensure you have all necessary imports from your original code) ...
+
+import asyncio
+import aiohttp
+import json
+import re
+from telegram import Update
+from telegram.ext import ContextTypes
+from sentence_transformers import SentenceTransformer
+from collections import deque, defaultdict
+from datetime import datetime, timezone
+import torch
+import torch.nn.functional as F
+from tenacity import retry, stop_after_attempt, wait_exponential
+# ... other imports ...
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     log = structlog.get_logger()
     user_id = str(update.effective_user.id)
     message = update.message
+    response_text = ""  # Initialize response_text
 
-    
     try:
         if message is None or message.text is None:
             log.warning("Received an update without a text message.", update=update)
             return
 
         content = message.text.strip()
-
-        # Send the typing indicator
         await bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
+        # --- User Profile Handling ---
         if user_id not in user_profiles:
             detected_language = await detect_language(content)
             user_profiles[user_id] = {
-                "preferences": {"communication_style": "friendly", "topics_of_interest": []},
-                "demographics": {"age": None, "location": None},
-                "history_summary": "",
-                "context": deque(maxlen=CONTEXT_WINDOW_SIZE),
-                "personality": DEFAULT_PERSONALITY.copy(),
-                "dialogue_state": "greeting",
-                "long_term_memory": [],
-                "last_bot_action": None,
-                "interests": [],
-                "query": "",
-                "planning_state": {},
-                "interaction_history": [],
-                "recent_topics": [],
-                "current_mood": "neutral",
-                "goals": [],
-                "preferred_language": detected_language
+                # ... (Your user profile dictionary) ...
             }
         else:
             detected_language = user_profiles[user_id].get("preferred_language", "en")
@@ -1892,61 +1899,101 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_profiles[user_id]["context"].append({"role": "user", "content": content})
         user_profiles[user_id]["query"] = content
 
-        await add_to_faiss_index(content)
-        await identify_user_interests(user_id, content)
-        relevant_history = await get_relevant_history(user_id, content)
-        summarized_search = await groq_search_and_summarize(content)
-        classifier = await async_load_or_create_classifier()
-        sentiment_analyzer = await async_load_or_create_sentiment_analyzer()
+        # --- Data Retrieval and Processing ---
+        await add_to_faiss_index(content) 
+        await identify_user_interests(user_id, content) 
+        relevant_history = await get_relevant_history(user_id, content) 
 
-        query_encoding = encoder(torch.tensor([embedding_model.encode(content)]).float().unsqueeze(0))
-        topic_probs = F.softmax(classifier(query_encoding.mean(dim=1)), dim=1)
-        current_topic = int(torch.argmax(topic_probs).item())
+        # Robust internet search with retry
+        max_retries = 3
+        summarized_search = None
 
-        is_continuous, continuity_message = await check_topic_continuity(user_id, current_topic)
-        related_memories = await get_related_memories(user_id, content, top_k=5)
-        sentiment_score = sentiment_analyzer(query_encoding.mean(dim=1)).item()
-        update_personality(user_profiles[user_id]["personality"], sentiment_score)
+        @retry(stop=stop_after_attempt(max_retries), wait=wait_exponential(multiplier=1, min=1, max=4))
+        async def search_with_retry(content, language):
+            return await advanced_multi_source_search(content, language=language)
 
-        prompt = f"""
-        User Query: {content}
-        Language: {detected_language}
-        Search Results Summary: {summarized_search}
-        Relevant History: {relevant_history}
-        Related Memories: {related_memories}
-        Current Topic: {current_topic}
-        Topic Continuity: {continuity_message}
-        User Personality: {user_profiles[user_id]["personality"]}
-        Sentiment Score: {sentiment_score}
+        try:
+            summarized_search = await search_with_retry(content, detected_language)
+        except Exception as e:
+            log.error(f"Internet search failed after multiple retries: {e}", exc_info=True)
+            response_text = "I'm having trouble accessing information right now. Please try again later."
 
-        As an AI assistant, analyze the given information and generate a response in {detected_language} that:
-        1. Directly addresses the user's query with accuracy and relevance
-        2. Incorporates the summarized search results to provide up-to-date information
-        3. Maintains context and topic continuity based on the conversation history
-        4. Incorporates relevant historical information and memories to provide a personalized response
-        5. Adapts to the user's personality and current sentiment, adjusting the tone accordingly
-        6. Ensures the response is coherent, well-structured, and easy to understand
-        7. Avoids biases and considers multiple perspectives when applicable
-        8. Offers additional relevant information or follow-up questions to encourage engagement
 
-        Format your response entirely in {detected_language}, ensuring it's natural and conversational.
-        """
+        if summarized_search:
+            # --- Model Inference and Response Generation ---
+            try:
+                classifier = await async_load_or_create_classifier()
+                sentiment_analyzer = await async_load_or_create_sentiment_analyzer()
+            except Exception as e:
+                log.error(f"Failed to load models: {e}", exc_info=True)
+                response_text = "There was an error loading the AI models. Please try again later."
+                
 
-        async with groq_throttler:
-            response_text, _, error_message = await advanced_reasoning_with_groq(prompt, GROQ_API_KEY, detected_language)
+            if response_text: #Check if error occurred during model loading
+                pass
+            else:
+                try:
+                    query_encoding = encoder(torch.tensor([embedding_model.encode(content)]).float().unsqueeze(0))
+                    topic_probs = F.softmax(classifier(query_encoding.mean(dim=1)), dim=1)
+                    current_topic = int(torch.argmax(topic_probs).item())
+                    
+                    is_continuous, continuity_message = await check_topic_continuity(user_id, current_topic) 
+                    related_memories = await get_related_memories(user_id, content, top_k=5) 
+                    sentiment_score = sentiment_analyzer(query_encoding.mean(dim=1)).item()
+                    update_personality(user_profiles[user_id]["personality"], sentiment_score) 
 
-        if error_message:
-            log.error(f"Groq API error: {error_message}", user_id=user_id, exc_info=True)
-            response_text = "I had a problem generating a response. Please try again later."
+                    prompt = f"""
+                    User Query: {content}
+                    Language: {detected_language}
+                    Search Results Summary: {summarized_search.get('summary', '')}
+                    Relevant History: {relevant_history}
+                    Related Memories: {related_memories}
+                    Current Topic: {current_topic}
+                    Topic Continuity: {continuity_message}
+                    User Personality: {user_profiles[user_id]["personality"]}
+                    Sentiment Score: {sentiment_score}
 
-      
-        await bot.send_message(chat_id=update.effective_chat.id, text=response_text, parse_mode="HTML", disable_web_page_preview=True)
-        await save_chat_history(user_id, content)
+                    As an AI assistant, analyze the given information and generate a response in {detected_language} that:
+                    1. Directly addresses the user's query with accuracy and relevance
+                    2. Incorporates the summarized search results to provide up-to-date information
+                    3. Maintains context and topic continuity based on the conversation history
+                    4. Incorporates relevant historical information and memories to provide a personalized response
+                    5. Adapts to the user's personality and current sentiment, adjusting the tone accordingly
+                    6. Ensures the response is coherent, well-structured, and easy to understand
+                    7. Avoids biases and considers multiple perspectives when applicable
+                    8. Offers additional relevant information or follow-up questions to encourage engagement
+
+                    Format your response entirely in {detected_language}, ensuring it's natural and conversational.
+                    """
+
+                    async with groq_throttler:
+                        response_text, _, error_message = await advanced_reasoning_with_groq(prompt, api_key=GROQ_API_KEY, language=detected_language)
+
+                    if error_message:
+                        log.error(f"Groq API error: {error_message}", user_id=user_id, exc_info=True)
+                        response_text = "I had a problem generating a response. Please try again later."
+                except Exception as e:
+                    log.error(f"Error during model inference: {e}", exc_info=True)
+                    response_text = "There was an error processing your request. Please try again later."
+
+
+        # --- Response and Data Persistence ---
+        if response_text: #Only send message if a response is generated
+            await bot.send_message(chat_id=update.effective_chat.id, text=response_text, parse_mode="HTML", disable_web_page_preview=True)
+
+        await save_chat_history(user_id, content)  
         user_profiles[user_id]["context"].append({"role": "assistant", "content": response_text})
-        save_user_profiles()
+        save_user_profiles()  
 
-        await update_persistent_models(content, response_text, sentiment_score, current_topic, classifier, sentiment_analyzer)
-        await update_language_model(content, response_text, sentiment_score)
+        try:
+            await update_persistent_models(content, response_text, sentiment_score, current_topic, classifier, sentiment_analyzer)  
+        except Exception as e:
+            log.error(f"Failed to update persistent models: {e}", exc_info=True)
+
+        try:
+            await update_language_model(content, response_text, sentiment_score)  
+        except Exception as e:
+            log.error(f"Failed to update language model: {e}", exc_info=True)
 
         elapsed_time = time.time() - start_time
         log.info(f"handle_message processed successfully in {elapsed_time:.2f} seconds", user_id=user_id)
@@ -1954,7 +2001,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"handle_message failed in {time.time() - start_time:.2f} seconds", user_id=user_id, exc_info=True)
         await bot.send_message(chat_id=update.effective_chat.id, text="An unexpected error occurred. Please try again later.")
- 
+
+        # --- Response and Data Persistence ---
+        await bot.send_message(chat_id=update.effective_chat.id, text=response_text, parse_mode="HTML", disable_web_page_preview=True)
+        await save_chat_history(user_id, content)  #Your save_chat_history function
+        user_profiles[user_id]["context"].append({"role": "assistant", "content": response_text})
+        save_user_profiles()  #Your save_user_profiles function
+
+        await update_persistent_models(content, response_text, sentiment_score, current_topic, classifier, sentiment_analyzer) #Your update_persistent_models function
+        await update_language_model(content, response_text, sentiment_score) #Your update_language_model function
+
+        elapsed_time = time.time() - start_time
+        log.info(f"handle_message processed successfully in {elapsed_time:.2f} seconds", user_id=user_id)
+
+    except Exception as e:
+        log.exception(f"handle_message failed in {time.time() - start_time:.2f} seconds", user_id=user_id, exc_info=True)
+        await bot.send_message(chat_id=update.effective_chat.id, text="An unexpected error occurred. Please try again later.")
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
