@@ -302,9 +302,8 @@ logger = logging.getLogger(__name__)
 search_cache = {}
 search_rate_limiter = asyncio.Semaphore(5)
 
-BOT_TOKEN = "your-telegram-token"
-GROQ_API_KEY = "your-groq-key"
-
+BOT_TOKEN = "telegram-bot-token"
+GROQ_API_KEY = "groq-api-key"
 
 
 
@@ -878,69 +877,160 @@ async def fetch_content_with_retry(url, session, timeout):
 # Function to fetch free proxies from free-proxy-list.net
 logging.basicConfig(level=logging.INFO)  # Set logging level as needed
 
+# Fetch free proxies asynchronously from multiple sources
 async def fetch_free_proxies():
-    url = 'https://www.free-proxy-list.net/'
+    proxy_sources = [
+        'https://www.free-proxy-list.net/',
+        'https://sslproxies.org/',
+        'https://www.us-proxy.org/',
+        'https://www.socks-proxy.net/',
+        'https://free-proxy-list.com/',
+        'https://www.proxy-list.download/HTTP',
+        'https://www.proxynova.com/proxy-server-list/',
+        'https://hidemy.name/en/proxy-list/',
+        'https://www.cool-proxy.net/proxies/http_proxy_list/sort:score/direction:desc',
+        'https://www.proxy-listen.de/Proxy/Proxyliste.html'
+    ]
 
-    # Setup Chrome options
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Run in headless mode if needed
+    proxies = set()  # Use a set to avoid duplicate proxies
+    max_proxies = 1000  # Maximum number of proxies to fetch
 
+    # Helper function to scrape proxies using requests
+    async def scrape_with_requests(url):
+        try:
+            headers = {'User-Agent': UserAgent().random}
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            table = soup.find('table')
+            if table:
+                rows = table.find_all('tr')
+                for row in rows[1:]:
+                    cols = row.find_all('td')
+                    if len(cols) >= 2:
+                        ip = cols[0].text.strip()
+                        port = cols[1].text.strip()
+                        proxy = f'http://{ip}:{port}'
+                        proxies.add(proxy)
+                        if len(proxies) >= max_proxies:
+                            break
+        except Exception as e:
+            logging.error(f"Error scraping {url}: {e}")
+
+    # Helper function to scrape proxies using Selenium
+    def scrape_with_selenium(url):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        
+        driver = None
+        try:
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+            driver.get(url)
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            table = soup.find('table')
+            if table:
+                rows = table.find_all('tr')
+                for row in rows[1:]:
+                    cols = row.find_all('td')
+                    if len(cols) >= 2:
+                        ip = cols[0].text.strip()
+                        port = cols[1].text.strip()
+                        proxy = f'http://{ip}:{port}'
+                        proxies.add(proxy)
+                        if len(proxies) >= max_proxies:
+                            break
+        except Exception as e:
+            logging.error(f"Error fetching proxies with Selenium from {url}: {e}")
+        finally:
+            if driver:
+                driver.quit()
+
+    # Concurrently scrape with both requests and Selenium
+    async def concurrent_scraping():
+        with ThreadPoolExecutor(max_workers=len(proxy_sources)) as executor:
+            tasks = []
+            for idx, url in enumerate(proxy_sources):
+                if idx % 2 == 0:  # Use requests for some URLs
+                    tasks.append(scrape_with_requests(url))
+                else:  # Use Selenium for others (run in thread pool)
+                    loop = asyncio.get_event_loop()
+                    tasks.append(loop.run_in_executor(executor, scrape_with_selenium, url))
+
+            await asyncio.gather(*tasks)
+
+    await concurrent_scraping()
+
+    if not proxies:
+        logging.warning("No proxies scraped, using fallback proxy list.")
+        fallback_proxies = [
+            'http://191.96.42.80:8080',
+            'http://167.172.248.53:3128',
+            'http://47.56.9.58:3128',
+            'http://185.199.229.156:8080',
+            'http://187.17.19.90:8080',
+            'http://212.83.172.174:3128',
+        ]
+        proxies.update(fallback_proxies)
+
+    logging.info(f"Fetched {len(proxies)} proxies.")
+    return list(proxies)  # Return as a list for further processing
+
+# Function to validate proxies
+def validate_proxy(proxy, test_url='https://duckduckgo.com'):
     try:
-        # Use ChromeDriverManager to automatically download and install ChromeDriver
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-        driver.get(url)
-
-        # Wait for the page to load (adjust sleep time as needed)
-        await asyncio.sleep(3)
-
-        # Parse the HTML content with BeautifulSoup
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        table = soup.find('table', class_='table-striped')
-
-        proxies = []
-
-        if table:
-            rows = table.find_all('tr')
-            for row in rows[1:]:  # Skip header row
-                columns = row.find_all('td')
-                if len(columns) >= 2:
-                    ip = columns[0].text.strip()
-                    port = columns[1].text.strip()
-                    proxy = f'http://{ip}:{port}'
-                    proxies.append(proxy)
-                    if len(proxies) >= 10:
-                        break
-
-            logging.info(f"Fetched {len(proxies)} proxies from {url}")
-            return proxies
-
+        response = requests.get(test_url, proxies={"http": proxy, "https": proxy}, timeout=5)
+        if response.status_code == 200:
+            logging.info(f"Proxy {proxy} is valid.")
+            return True
+        elif response.status_code == 429:
+            logging.warning(f"Proxy {proxy} is rate-limited (HTTP 429).")
+            return False  # Rate-limited proxy should be switched
         else:
-            logging.error("Failed to find proxy table on the page.")
-            return []
-
+            logging.warning(f"Proxy {proxy} failed with status code {response.status_code}.")
+            return False
     except Exception as e:
-        logging.error(f"Error fetching proxies: {e}")
-        return []
+        logging.error(f"Proxy {proxy} is invalid: {e}")
+        return False
 
-    finally:
-        if 'driver' in locals() or 'driver' in globals():
-            driver.quit()
+# Function to get a valid proxy and retry if necessary
+async def get_valid_proxy(proxies):
+    for proxy in proxies:
+        if validate_proxy(proxy):
+            return proxy
+    logging.error("No valid proxies found.")
+    return None
 
-# Function to validate proxies by sending a test request (example implementation)
-async def validate_proxies():
-    valid_proxies = []
-    async with ClientSession() as session:
-        for proxy in proxies:
-            try:
-                async with session.get("https://www.youtube.com/", proxy=proxy, timeout=10) as response:
-                    if response.status == 200:
-                        valid_proxies.append(proxy)
-            except Exception as e:
-                logging.error(f"Proxy {proxy} validation error: {str(e)}")
-    return valid_proxies
+# Use proxy for fetching information and retry if rate-limited
+async def fetch_with_proxy():
+    proxies = await fetch_free_proxies()
+    valid_proxy = await get_valid_proxy(proxies)
+
+    if not valid_proxy:
+        logging.error("Could not find a valid proxy.")
+        return None
+
+    retry_attempts = 5
+    for attempt in range(retry_attempts):
+        try:
+            response = requests.get('https://duckduckgo.com', proxies={"http": valid_proxy, "https": valid_proxy}, timeout=10)
+            if response.status_code == 200:
+                logging.info(f"Success with proxy {valid_proxy}")
+                return response.text
+            elif response.status_code == 429:
+                logging.warning(f"Proxy {valid_proxy} got rate-limited. Retrying with a different proxy...")
+                valid_proxy = await get_valid_proxy(proxies)  # Switch to another proxy and retry
+        except Exception as e:
+            logging.error(f"Error using proxy {valid_proxy}: {e}")
+            valid_proxy = await get_valid_proxy(proxies)  # Switch to another proxy and retry
+
+    logging.error("All retry attempts failed.")
+    return None
+
 
 # Advanced multi-source search function
-async def advanced_multi_source_search(query: str, language: str = "en", num_sites: int = 10, max_depth: int = 3, timeout: int = 30):
+async def advanced_multi_source_search(query: str, language: str = "en", num_sites: int = 300, max_depth: int = 3, timeout: int = 30):
     async with search_rate_limiter:
         if not await check_internet():
             logger.error("No internet connection. Aborting search.")
