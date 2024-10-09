@@ -307,6 +307,7 @@ GROQ_API_KEY = "your-groq-key"
 
 
 
+
 async def initialize_bot():
     global user_profiles, bot, application, faiss_index, embedding_model, encoder, AsyncGroq
     try:
@@ -576,7 +577,15 @@ Format your response entirely in the language of the user, ensuring it's natural
     self_reflection_text, _, _ = await advanced_reasoning_with_groq(prompt, [], "", user_id, message, api_key)
     return self_reflection_text
 
-async def advanced_reasoning_with_groq(query, relevant_history=None, summarized_search=None, user_id=None, message=None, api_key=None, language="en", model="llama-3.2-90b-text-preview", timeout=30, max_tokens=512, temperature=0.7, top_p=1):
+
+
+
+
+
+
+
+
+async def advanced_reasoning_with_groq(query, relevant_history=None, summarized_search=None, user_id=None, message=None, api_key=GROQ_API_KEY, language="en", model="llama-3.2-90b-text-preview", timeout=30, max_tokens=512, temperature=0.7, top_p=1):
     start_time = time.time()
     response_text = ""
     error_message = None
@@ -593,7 +602,6 @@ async def advanced_reasoning_with_groq(query, relevant_history=None, summarized_
         structlog.get_logger().info("History encoding completed.")
         topic_probs = F.softmax(classifier(query_encoding.mean(dim=1)), dim=1)
         current_topic = torch.argmax(topic_probs).item()
-        current_topic = int(current_topic)
         structlog.get_logger().info(f"Current topic identified: {current_topic}")
         is_continuous, continuity_message = await check_topic_continuity(user_id, current_topic)
         structlog.get_logger().info(f"Topic continuity checked: {is_continuous}, {continuity_message}")
@@ -602,29 +610,37 @@ async def advanced_reasoning_with_groq(query, relevant_history=None, summarized_
         sentiment_score = sentiment_analyzer(query_encoding.mean(dim=1)).item()
         update_personality(user_profiles[user_id]["personality"], sentiment_score)
         structlog.get_logger().info(f"Sentiment score calculated: {sentiment_score}")
+
         prompt = f"""
-User Query: {query}
-Language: {language}
-Search Results: {summarized_search}
-Relevant History: {relevant_history}
-Related Memories: {related_memories}
-Current Topic: {current_topic}
-Topic Continuity: {continuity_message}
-User Personality: {user_profiles[user_id]["personality"]}
-Sentiment Score: {sentiment_score}
+        User Query: {query}
+        Language: {language}
+        Search Results: {summarized_search}
+        Relevant History: {relevant_history}
+        Related Memories: {related_memories}
+        Current Topic: {current_topic}
+        Topic Continuity: {continuity_message}
+        User Personality: {user_profiles[user_id]["personality"]}
+        Sentiment Score: {sentiment_score}
 
-As an advanced AI assistant, analyze the given information and generate a response in {language} that:
-    1. Directly addresses the user's query with accuracy and relevance
-    2. Incorporates the search results to provide up-to-date information
-    3. Maintains context and topic continuity based on the conversation history
-    4. Incorporates relevant historical information and memories to provide a personalized response
-    5. Adapts to the user's personality and current sentiment, adjusting the tone accordingly
-    6. Ensures the response is coherent, well-structured, and easy to understand
-    7. Avoids biases and considers multiple perspectives when applicable
-    8. Offers additional relevant information or follow-up questions to encourage engagement
+        As an advanced AI assistant, analyze the given information and generate a response in {language} that:
+        1. Directly addresses the user's query with accuracy and relevance
+        2. Incorporates the search results to provide up-to-date information
+        3. Maintains context and topic continuity based on the conversation history
+        4. Incorporates relevant historical information and memories to provide a personalized response
+        5. Adapts to the user's personality and current sentiment, adjusting the tone accordingly
+        6. Ensures the response is coherent, well-structured, and easy to understand
+        7. Avoids biases and considers multiple perspectives when applicable
+        8. Offers additional relevant information or follow-up questions to encourage engagement
 
-    Format your response entirely in {language}, ensuring it's natural and conversational.
-    """
+        Format your response entirely in {language}, ensuring it's natural and conversational.
+        """
+
+        # Ensure api_key is set
+        if not api_key:
+            structlog.get_logger().error("API key not provided for Groq client.")
+            error_message = "API key not provided for Groq client."
+            return "", time.time() - start_time, error_message
+
         async with AsyncGroq(api_key=api_key) as client:
             try:
                 completion_iterator = await client.chat.completions.create(
@@ -648,6 +664,7 @@ As an advanced AI assistant, analyze the given information and generate a respon
             except Exception as e:
                 error_message = f"Groq API request failed: {e}"
                 structlog.get_logger().error(error_message, exc_info=True)
+
         if not error_message:
             structlog.get_logger().info("Response generated successfully.")
             user_profiles[user_id]["context"].append({"role": "assistant", "content": response_text})
@@ -672,6 +689,15 @@ As an advanced AI assistant, analyze the given information and generate a respon
         error_message = f"An error occurred during advanced reasoning: {e}"
         structlog.get_logger().error("Advanced reasoning failed:", exc_info=True, traceback=traceback.format_exc())
         return "", time.time() - start_time, error_message
+
+
+
+
+
+
+
+
+
 
 async def self_reflect_and_fix_errors(query, relevant_history, summarized_search, user_id, message, api_key):
     try:
@@ -1001,7 +1027,7 @@ async def advanced_multi_source_search(query: str, language: str = "en", num_sit
             # Handle rate limiting by switching to proxies
             if "Ratelimit" in str(e):
                 logger.warning("DuckDuckGo rate limit detected. Switching to proxies.")
-                
+
                 if proxies:
                     for proxy in proxies:
                         try:
@@ -1079,6 +1105,7 @@ async def advanced_multi_source_search(query: str, language: str = "en", num_sit
                             logger.error(f"Error using proxy {proxy}: {proxy_exception}")
 
             return None
+
 
 
 
@@ -1732,30 +1759,22 @@ async def keep_typing(chat_id):
         await bot.send_chat_action(chat_id=chat_id, action="typing")
         await asyncio.sleep(3)
 
-
- 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     log = structlog.get_logger()
     user_id = str(update.effective_user.id)
     message = update.message
 
-    async def continuous_typing(chat_id, event):
-        async with context.bot.action_lock:
-            while not event.is_set():
-                try:
-                    await bot.send_chat_action(chat_id=chat_id, action="typing")
-                    await asyncio.sleep(4) # Adjust typing interval as needed
-                except Exception as e:
-                    log.error(f"Error sending typing action: {e}")
-                    break
-
+    
     try:
         if message is None or message.text is None:
             log.warning("Received an update without a text message.", update=update)
             return
 
         content = message.text.strip()
+
+        # Send the typing indicator
+        await bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
         if user_id not in user_profiles:
             detected_language = await detect_language(content)
@@ -1786,7 +1805,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await add_to_faiss_index(content)
         await identify_user_interests(user_id, content)
         relevant_history = await get_relevant_history(user_id, content)
-        search_results = await advanced_multi_source_search(content, language=detected_language)
         summarized_search = await groq_search_and_summarize(content)
         classifier = await async_load_or_create_classifier()
         sentiment_analyzer = await async_load_or_create_sentiment_analyzer()
@@ -1824,26 +1842,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         Format your response entirely in {detected_language}, ensuring it's natural and conversational.
         """
 
-        action_event = asyncio.Event()
-        typing_task = asyncio.create_task(continuous_typing(update.effective_chat.id, action_event))
-
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
-        async def groq_call_with_retry(prompt, api_key, language):
-            try:
-                return await advanced_reasoning_with_groq(prompt, api_key=api_key, language=language, timeout=60)
-            except Exception as e:
-                log.error(f"Groq API call failed: {e}")
-                raise
-
         async with groq_throttler:
-            response_text, _, error_message = await groq_call_with_retry(prompt, GROQ_API_KEY, detected_language)
+            response_text, _, error_message = await advanced_reasoning_with_groq(prompt, GROQ_API_KEY, detected_language)
 
         if error_message:
             log.error(f"Groq API error: {error_message}", user_id=user_id, exc_info=True)
             response_text = "I had a problem generating a response. Please try again later."
 
-        action_event.set()
-        await typing_task
+      
         await bot.send_message(chat_id=update.effective_chat.id, text=response_text, parse_mode="HTML", disable_web_page_preview=True)
         await save_chat_history(user_id, content)
         user_profiles[user_id]["context"].append({"role": "assistant", "content": response_text})
@@ -1858,6 +1864,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"handle_message failed in {time.time() - start_time:.2f} seconds", user_id=user_id, exc_info=True)
         await bot.send_message(chat_id=update.effective_chat.id, text="An unexpected error occurred. Please try again later.")
+ 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
